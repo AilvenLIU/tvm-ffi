@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import consts as C
-from .file_utils import FileInfo, collect_files, syntax_for
+from .file_utils import CodeBlock, FileInfo, collect_files, syntax_for
 from .generator import generator_names, get_generator
 from .layout import classify, write_coverage_report
 from .lib_state import (
@@ -96,6 +96,10 @@ def __main__() -> int:
             generator=generator,
         )
 
+    # Stage 2b. Add the object blocks a `tvm-ffi-stubgen(prefix)` file asks for. This runs
+    # after `--init`, which rewrites files on disk and reloads them.
+    failed += _roll_out_prefixes(files)
+
     # Stage 3: Process
     # - `tvm-ffi-stubgen(begin): global/...`
     # - `tvm-ffi-stubgen(begin): object/...`
@@ -162,6 +166,64 @@ def _stage_1(
         ty_map[lhs.strip()] = rhs.strip()
 
 
+def _roll_out_prefixes(files: list[FileInfo]) -> int:
+    """Append an ``object/<key>`` block for each registered object under a file's ``prefix``.
+
+    Keys with a block in any file of the run, or named by ``skip``, are left alone; an
+    ``import-section`` is added when the file has none. Returns the number of bad files.
+    """
+    defined = {
+        code.param for file in files for code in file.code_blocks if code.kind == "object"
+    } | C.BUILTIN_TYPE_KEYS
+    registry = collect_type_keys()
+    owners: dict[str, Path] = {}
+    failed = 0
+    for file in files:
+        directives = [c for c in file.code_blocks if c.kind == "directive"]
+        heads = [c for c in directives if c.param[0] == "prefix"]
+        if not heads:
+            continue
+        head = heads[0]
+        prefix = head.param[1].rstrip(".")
+        error = ""
+        if len(heads) > 1:
+            error = f"more than one `prefix` directive (line {heads[1].lineno_start})"
+        elif owners.setdefault(prefix, file.path) != file.path:
+            error = f"prefix `{prefix}` is already declared by {owners[prefix]}"
+        if error:
+            failed += 1
+            print(f'{C.TERM_RED}[Failed] File "{file.path}": {error}{C.TERM_RESET}')
+            continue
+        if prefix not in registry:
+            print(
+                f"{C.TERM_YELLOW}[Skipped] No registered object under prefix `{prefix}`{C.TERM_RESET}"
+            )
+            continue
+        skipped = {c.param[1].strip() for c in directives if c.param[0] == "skip"}
+        keys = [key for key in registry[prefix] if key not in defined and key not in skipped]
+        blocks = file.code_blocks
+        if not any(c.kind == "import-section" for c in blocks):
+            at = blocks.index(head) + 1
+            blocks[at:at] = _new_blocks(file.syntax, head.lineno_start, "import-section")
+        at = max(i for i, c in enumerate(blocks) if c.kind in ("object", "import-section")) + 1
+        blocks[at:at] = [
+            block
+            for info in toposort_objects(keys)
+            for block in _new_blocks(file.syntax, head.lineno_start, f"object/{info.type_key}")
+        ]
+    return failed
+
+
+def _new_blocks(syntax: C.MarkerSyntax, lineno: int, stub: str) -> list[CodeBlock]:
+    """Return a blank line and an empty ``begin``/``end`` block for ``stub``, to insert into a file."""
+    begin = f"{syntax.begin} {stub}"
+    block = CodeBlock.from_begin_line(lineno, begin, syntax)
+    block.lineno_end = lineno
+    block.lines = [begin, syntax.end]
+    blank = CodeBlock(kind=None, param="", lineno_start=lineno, lineno_end=lineno, lines=[""])
+    return [blank, block]
+
+
 def _stage_2(
     files: list[FileInfo],
     ty_map: dict[str, str],
@@ -190,6 +252,12 @@ def _stage_2(
     defined_objs: set[str] = {  # ty: ignore[invalid-assignment]
         code.param for file in files for code in file.code_blocks if code.kind == "object"
     } | C.BUILTIN_TYPE_KEYS
+    skipped: set[str] = {
+        code.param[1].strip()
+        for file in files
+        for code in file.code_blocks
+        if code.kind == "directive" and code.param[0] == "skip"
+    }
 
     # Step 0. Generate missing `_ffi_api.py` and `__init__.py` under each prefix.
     prefix_filter = init_cfg.prefix.strip()
@@ -207,7 +275,7 @@ def _stage_2(
             [] if prefix in defined_func_prefixes else global_funcs.get(prefix, []),
             key=lambda f: f.schema.name,
         )
-        objs = sorted(set(obj_names) - defined_objs)
+        objs = sorted(set(obj_names) - defined_objs - skipped)
         object_infos = toposort_objects(objs)
         if not funcs and not object_infos:
             continue

@@ -387,6 +387,16 @@ When you run the tool, it:
 
       # tvm-ffi-stubgen(ty-map): ffi.reflection.AccessStep -> ffi.access_path.AccessStep
 
+``prefix`` - Demand a Namespace
+   Rust target only. Adds an ``object/<type_key>`` block to the file for every object
+   registered directly under the prefix that no processed file defines yet; ``skip``
+   leaves one out. Code outside the blocks is preserved.
+
+   .. code-block:: rust
+
+      // tvm-ffi-stubgen(prefix): my_ffi_extension
+      // tvm-ffi-stubgen(skip): my_ffi_extension.Internal
+
 ``import-object`` - Import Object
    Injects a custom import into generated code. The format is
    ``<full_name>;<type_checking_only>;<alias>``.

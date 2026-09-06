@@ -1302,3 +1302,131 @@ def test_stage_3_checks_dependencies_across_the_run(tmp_path: Path) -> None:
     text = "\n".join(line for block in info.code_blocks for line in block.lines)
     assert "    base: TestCxxClassBaseObj," in text
     assert "use crate::hand::TestCxxClassBaseObj;" in text
+
+
+# ---------------------------------------------------------------------------
+# `prefix` / `skip`: a file declares a namespace and the blocks are rolled out
+# ---------------------------------------------------------------------------
+
+
+def test_prefix_directive_rolls_out_a_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "testing.rs"
+    src.write_text(
+        "\n".join(
+            [
+                "//! Hand-written skeleton.",
+                f"{C.RUST_SYNTAX.directive('prefix')} testing",
+                f"{C.RUST_SYNTAX.directive('skip')} testing.TestCxxClassDerivedDerived",
+                "",
+                f"{C.RUST_SYNTAX.begin} object/testing.TestCxxClassBase",
+                C.RUST_SYNTAX.end,
+                "",
+                "pub fn hand_written() {}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    check = ["tvm-ffi-stubgen", "--target", "rust", "--check", str(tmp_path)]
+    monkeypatch.setattr("sys.argv", check)
+    assert stub_cli.__main__() == 1  # the blocks still to be added make the file stale
+    monkeypatch.setattr("sys.argv", ["tvm-ffi-stubgen", "--target", "rust", str(tmp_path)])
+    assert stub_cli.__main__() == 0
+    text = src.read_text(encoding="utf-8")
+    begins = [line for line in text.splitlines() if line.startswith(C.RUST_SYNTAX.begin)]
+    # An import section is added after the `prefix` line; the existing block is kept once.
+    assert begins[0] == f"{C.RUST_SYNTAX.begin} import-section"
+    assert begins[1] == f"{C.RUST_SYNTAX.begin} object/testing.TestCxxClassBase"
+    assert text.count("object/testing.TestCxxClassBase\n") == 1
+    # The rest of the namespace follows, parents first; the skipped leaf is absent.
+    derived = begins.index(f"{C.RUST_SYNTAX.begin} object/testing.TestCxxClassDerived")
+    assert derived > 1
+    assert "object/testing.TestCxxClassDerivedDerived" not in text
+    assert "pub struct TestCxxClassDerivedObj {" in text
+    assert text.endswith("pub fn hand_written() {}\n")
+    monkeypatch.setattr("sys.argv", check)
+    assert stub_cli.__main__() == 0
+
+
+def test_prefix_declared_twice_is_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("a.rs", "b.rs"):
+        (tmp_path / name).write_text(
+            f"{C.RUST_SYNTAX.directive('prefix')} testing\n", encoding="utf-8"
+        )
+    monkeypatch.setattr(
+        "sys.argv", ["tvm-ffi-stubgen", "--target", "rust", "--check", str(tmp_path)]
+    )
+    assert stub_cli.__main__() == 2
+
+
+def test_roll_out_matches_the_prefix_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        stub_cli,
+        "collect_type_keys",
+        lambda: {"a": ["a.Y", "a.X"], "a.b": ["a.b.Z"], "ffi": ["ffi.Object"]},
+    )
+    monkeypatch.setattr(
+        stub_cli,
+        "toposort_objects",
+        lambda keys: [ObjectInfo(fields=[], methods=[], type_key=key) for key in sorted(keys)],
+    )
+    begin, end = C.RUST_SYNTAX.begin, C.RUST_SYNTAX.end
+    src = tmp_path / "a.rs"
+    src.write_text(
+        "\n".join(
+            [
+                f"{C.RUST_SYNTAX.directive('prefix')} a.",
+                f"{begin} import-section",
+                end,
+                "mod tail {}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    info = FileInfo.from_file(src)
+    assert info is not None
+    assert stub_cli._roll_out_prefixes([info]) == 0
+    assert [line for block in info.code_blocks for line in block.lines] == [
+        f"{C.RUST_SYNTAX.directive('prefix')} a.",
+        f"{begin} import-section",
+        end,
+        "",
+        f"{begin} object/a.X",
+        end,
+        "",
+        f"{begin} object/a.Y",
+        end,
+        "mod tail {}",
+    ]
+    # Builtin type keys live in the crate and are never rolled out.
+    src.write_text(f"{C.RUST_SYNTAX.directive('prefix')} ffi\n", encoding="utf-8")
+    info = FileInfo.from_file(src)
+    assert info is not None
+    assert stub_cli._roll_out_prefixes([info]) == 0
+    assert not any(block.kind == "object" for block in info.code_blocks)
+
+
+def test_prefix_survives_init(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--init` rewrites the file on disk and reloads it; the roll-out must come after that."""
+    (tmp_path / "testing").mkdir()
+    mod_rs = tmp_path / "testing" / "mod.rs"
+    skip = f"{C.RUST_SYNTAX.directive('skip')} testing.TestCxxClassDerivedDerived"
+    mod_rs.write_text(f"{C.RUST_SYNTAX.directive('prefix')} testing\n{skip}\n", encoding="utf-8")
+    init = ["--init-pypkg", "demo", "--init-lib", "demo_shared", "--init-prefix", "testing."]
+    monkeypatch.setattr("sys.argv", ["tvm-ffi-stubgen", "--target", "rust", *init, str(tmp_path)])
+    assert stub_cli.__main__() == 0
+    text = mod_rs.read_text(encoding="utf-8")
+    assert text.startswith(f"{C.RUST_SYNTAX.directive('prefix')} testing\n")
+    assert "pub struct TestCxxClassDerivedObj {" in text
+    assert "object/testing.TestCxxClassDerivedDerived" not in text  # `--init` honours `skip`
+    monkeypatch.setattr(
+        "sys.argv", ["tvm-ffi-stubgen", "--target", "rust", "--check", str(tmp_path)]
+    )
+    assert stub_cli.__main__() == 0
